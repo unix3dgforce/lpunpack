@@ -3,8 +3,8 @@
 lpunpack.py - command-line tool for extracting partition images from super
 
 positional arguments:  
-	SUPER_IMAGE  
-	OUTPUT_DIR  
+||||||||||SUPER_IMAGE  
+-OUTPUT_DIR  
 
 optional arguments:  
     	-h, --help show this help message and exit  
