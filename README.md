@@ -13,4 +13,4 @@
     	-p NAME, --partition NAME Extract the named partition. This can be specified multiple times or through the delimiter ["," ":"]  
     	-S NUM, --slot NUM !!! No implementation yet !!! Slot number (default is 0).  
   
-<style="color:red">!!! No implemetation extract A and B slot index</style>
+No implemetation extract A and B slot index
