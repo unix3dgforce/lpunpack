@@ -291,6 +291,9 @@ class LpUnpack(object):
                 else:
                     print('Read Backup header by offset 0x{:x}'.format(offsets[index + 1]))
                     continue
+
+            self.in_file_fd.seek(offset + header.header_size, 0)
+
         return header
 
     def ReadMetadata(self):
@@ -356,11 +359,17 @@ class LpUnpack(object):
                 size -= meta.geometry.logical_block_size
         print(' [ok]')
 
-    def Extract(self, index, partition, metadata):
+    def Extract(self, partition, metadata):
+        offset = 0
+        size = 0
+
         unpack = namedtuple('Unpack', 'name offset size geometry')
-        extent = metadata.extents[index]
-        offset = extent.target_data * LP_SECTOR_SIZE
-        size = extent.num_sectors * LP_SECTOR_SIZE
+
+        if partition.num_extents != 0:
+            extent = metadata.extents[partition.first_extent_index]
+            offset = extent.target_data * LP_SECTOR_SIZE
+            size = extent.num_sectors * LP_SECTOR_SIZE
+
         self.ExtractPartition(unpack(partition.name, offset, size, metadata.geometry))
 
     def unpack(self):
@@ -392,10 +401,8 @@ class LpUnpack(object):
                 if self.slot_num > metadata.geometry.metadata_slot_count:
                     raise LpUnpackError('Invalid metadata slot number: {}'.format(self.slot_num))
 
-            for index, partition in enumerate(metadata.partitions):
-                self.Extract(index, partition, metadata)
-
-
+            for partition in metadata.partitions:
+                self.Extract(partition, metadata)
 
         except LpUnpackError as e:
             print(e.message)
@@ -404,7 +411,7 @@ class LpUnpack(object):
             self.in_file_fd.close()
 
 
-def createParser():
+def create_parser():
     parser = argparse.ArgumentParser(description='{} - command-line tool for extracting partition images from super'
                                      .format(Path(sys.argv[0]).name))
     parser.add_argument(
@@ -435,7 +442,7 @@ def help(parser):
 
 
 if __name__ == '__main__':
-    parser = createParser()
+    parser = create_parser()
     namespace = parser.parse_args()
     if len(sys.argv) >= 2:
         if not Path(namespace.SUPER_IMAGE).exists():
