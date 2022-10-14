@@ -4,6 +4,8 @@ import argparse
 from pathlib import Path
 from collections import namedtuple
 from struct import pack, unpack, calcsize
+from dataclasses import dataclass, field
+from typing import IO
 
 SPARSE_HEADER_MAGIC = 0xED26FF3A
 SPARSE_HEADER_SIZE = 28
@@ -14,6 +16,7 @@ LP_METADATA_GEOMETRY_MAGIC = 0x616c4467
 LP_METADATA_GEOMETRY_SIZE = 4096
 LP_METADATA_HEADER_MAGIC = 0x414C5030
 LP_SECTOR_SIZE = 512
+LP_TARGET_TYPE_LINEAR = 0
 
 
 class SparseHeader(object):
@@ -174,6 +177,14 @@ class LpUnpackError(Exception):
 
     def __str__(self):
         return self.message
+
+
+@dataclass
+class UnpackJob:
+    name: str
+    geometry: LpMetadataGeometry
+    parts: list[tuple[int, int]] = field(default_factory=list)
+    total_size: int = field(default=0)
 
 
 class SparseImage(object):
@@ -345,32 +356,44 @@ class LpUnpack(object):
 
         return metadata
 
-    def ExtractPartition(self, meta):
+    def _WriteExtent(self, fd: IO, offset: int, size: int, block_size: int):
+        self.in_file_fd.seek(offset)
+        for block in self._ReadChunk(block_size):
+            if size == 0:
+                break
+
+            fd.write(block)
+
+            size -= block_size
+
+    def ExtractPartition(self, unpack_job: UnpackJob):
         self._CheckOutDirExists()
-        print('Extracting partition [{}] ....'.format(meta.name), end='', flush=True)
-        out_file = Path(self.out_dir / "{name}.img".format(name=meta.name))
-        size = meta.size
-        self.in_file_fd.seek(meta.offset)
+        print(f'Extracting partition [{unpack_job.name}] ....', end='', flush=True)
+        out_file = self.out_dir / f'{unpack_job.name}.img'
         with open(str(out_file), 'wb') as out:
-            for block in self._ReadChunk(meta.geometry.logical_block_size):
-                if size == 0:
-                    break
-                out.write(block)
-                size -= meta.geometry.logical_block_size
+            for part in unpack_job.parts:
+                offset, size = part
+                self._WriteExtent(out, offset, size, unpack_job.geometry.logical_block_size)
+
         print(' [ok]')
 
     def Extract(self, partition, metadata):
-        offset = 0
-        size = 0
-
-        unpack = namedtuple('Unpack', 'name offset size geometry')
+        unpack_job = UnpackJob(name=partition.name, geometry=metadata.geometry)
 
         if partition.num_extents != 0:
-            extent = metadata.extents[partition.first_extent_index]
-            offset = extent.target_data * LP_SECTOR_SIZE
-            size = extent.num_sectors * LP_SECTOR_SIZE
+            for extent_number in range(partition.num_extents):
+                index = partition.first_extent_index + extent_number
+                extent = metadata.extents[index]
 
-        self.ExtractPartition(unpack(partition.name, offset, size, metadata.geometry))
+                if extent.target_type != LP_TARGET_TYPE_LINEAR:
+                    raise LpUnpackError(f'Unsupported target type in extent: {extent.target_type}')
+
+                offset = extent.target_data * LP_SECTOR_SIZE
+                size = extent.num_sectors * LP_SECTOR_SIZE
+                unpack_job.parts.append((offset, size))
+                unpack_job.total_size += size
+
+        self.ExtractPartition(unpack_job)
 
     def unpack(self):
         try:
@@ -391,11 +414,11 @@ class LpUnpack(object):
                 for index, partition in enumerate(metadata.partitions):
                     if partition.name in self.partition_name:
                         filter_partition.append(partition)
-                        filter_extents.append(metadata.extents[index])
+
                 if not filter_partition:
                     raise LpUnpackError('Could not find partition: {}'.format(self.partition_name))
+
                 metadata.partitions = filter_partition
-                metadata.extents = filter_extents
 
             if self.slot_num:
                 if self.slot_num > metadata.geometry.metadata_slot_count:
