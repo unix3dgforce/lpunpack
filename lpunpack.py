@@ -1,10 +1,10 @@
 import argparse
 import re
+import struct
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from struct import pack, unpack, calcsize
-from typing import IO
+from typing import IO, Dict, Iterable
 
 SPARSE_HEADER_MAGIC = 0xED26FF3A
 SPARSE_HEADER_SIZE = 28
@@ -22,16 +22,16 @@ class SparseHeader(object):
     def __init__(self, buffer):
         fmt = '<I4H4I'
         (
-            self.magic,  # 0xed26ff3a
-            self.major_version,  # (0x1) - reject images with higher major versions
-            self.minor_version,  # (0x0) - allow images with higer minor versions
-            self.file_hdr_sz,  # 28 bytes for first revision of the file format
-            self.chunk_hdr_sz,  # 12 bytes for first revision of the file format
-            self.blk_sz,  # block size in bytes, must be a multiple of 4 (4096)
-            self.total_blks,  # total blocks in the non-sparse output image
-            self.total_chunks,  # total chunks in the sparse input image
+            self.magic,             # 0xed26ff3a
+            self.major_version,     # (0x1) - reject images with higher major versions
+            self.minor_version,     # (0x0) - allow images with higer minor versions
+            self.file_hdr_sz,       # 28 bytes for first revision of the file format
+            self.chunk_hdr_sz,      # 12 bytes for first revision of the file format
+            self.blk_sz,            # block size in bytes, must be a multiple of 4 (4096)
+            self.total_blks,        # total blocks in the non-sparse output image
+            self.total_chunks,      # total chunks in the sparse input image
             self.image_checksum     # CRC32 checksum of the original data, counting "don't care"
-        ) = unpack(fmt, buffer[0:calcsize(fmt)])
+        ) = struct.unpack(fmt, buffer[0:struct.calcsize(fmt)])
 
 
 class SparseChunkHeader(object):
@@ -41,27 +41,44 @@ class SparseChunkHeader(object):
         For a Fill chunk, it's 4 bytes of the fill data.
         For a CRC32 chunk, it's 4 bytes of CRC32
      """
+
     def __init__(self, buffer):
         fmt = '<2H2I'
         (
             self.chunk_type,        # 0xCAC1 -> raw; 0xCAC2 -> fill; 0xCAC3 -> don't care */
-            self.reserved1,
+            self.reserved,
             self.chunk_sz,          # in blocks in output image * /
             self.total_sz,          # in bytes of chunk input file including chunk header and data * /
-        ) = unpack(fmt, buffer[0:calcsize(fmt)])
+        ) = struct.unpack(fmt, buffer[0:struct.calcsize(fmt)])
 
 
-class LpMetadataGeometry(object):
+class LpMetadataBase:
+    _fmt = None
+
+    @classmethod
+    @property
+    def size(cls) -> int:
+        return struct.calcsize(cls._fmt)
+
+
+class LpMetadataGeometry(LpMetadataBase):
     """
-        Offset 0: Magic signature
-        Offset 4: Size of the LpMetadataGeometry
-        Offset 8: SHA256 checksum
-        Offset 40: Maximum amount of space a single copy of the metadata can use
-        Offset 44: Number of copies of the metadata to keep
-        Offset 48: Logical block size
+    Offset 0: Magic signature
+
+    Offset 4: Size of the `MetadataGeometry`
+
+    Offset 8: SHA256 checksum
+
+    Offset 40: Maximum amount of space a single copy of the metadata can use
+
+    Offset 44: Number of copies of the metadata to keep
+
+    Offset 48: Logical block size
     """
+
+    _fmt = '<2I32s3I'
+
     def __init__(self, buffer):
-        fmt = '<2I32s3I'
         (
             self.magic,
             self.struct_size,
@@ -70,21 +87,140 @@ class LpMetadataGeometry(object):
             self.metadata_slot_count,
             self.logical_block_size
 
-        ) = unpack(fmt, buffer[0:calcsize(fmt)])
+        ) = struct.unpack(self._fmt, buffer[0:self.size])
 
 
-class LpMetadataHeader(object):
+class LpMetadataTableDescriptor(LpMetadataBase):
     """
-        +-----------------------------------------+
-        | Header data - fixed size                |
-        +-----------------------------------------+
-        | Partition table - variable size         |
-        +-----------------------------------------+
-        | Partition table extents - variable size |
-        +-----------------------------------------+
+    Offset 0: Location of the table, relative to end of the metadata header.
+
+    Offset 4: Number of entries in the table.
+
+    Offset 8: Size of each entry in the table, in bytes.
     """
+
+    _fmt = '<3I'
+
     def __init__(self, buffer):
-        fmt = '<I2hI32sI32s'
+        (
+            self.offset,
+            self.num_entries,
+            self.entry_size
+
+        ) = struct.unpack(self._fmt, buffer[:self.size])
+
+
+class LpMetadataPartition(LpMetadataBase):
+    """
+    Offset 0: Name of this partition in ASCII characters. Any unused characters in
+              the buffer must be set to 0. Characters may only be alphanumeric or _.
+              The name must include at least one ASCII character, and it must be unique
+              across all partition names. The length (36) is the same as the maximum
+              length of a GPT partition name.
+
+    Offset 36: Attributes for the partition (see LP_PARTITION_ATTR_* flags above).
+
+    Offset 40: Index of the first extent owned by this partition. The extent will
+               start at logical sector 0. Gaps between extents are not allowed.
+
+    Offset 44: Number of extents in the partition. Every partition must have at least one extent.
+
+    Offset 48: Group this partition belongs to.
+    """
+
+    _fmt = '<36s4I'
+
+    def __init__(self, buffer):
+        (
+            self.name,
+            self.attributes,
+            self.first_extent_index,
+            self.num_extents,
+            self.group_index
+
+        ) = struct.unpack(self._fmt, buffer[0:self.size])
+
+        self.name = self.name.decode("utf-8").strip('\x00')
+
+    @property
+    def filename(self) -> str:
+        return f'{self.name}.img'
+
+
+class LpMetadataExtent(LpMetadataBase):
+    """
+    Offset 0: Length of this extent, in 512-byte sectors.
+
+    Offset 8: Target type for device-mapper (see LP_TARGET_TYPE_* values).
+
+    Offset 12: Contents depends on target_type. LINEAR: The sector on the physical partition that this extent maps onto.
+               ZERO: This field must be 0.
+
+    Offset 20: Contents depends on target_type. LINEAR: Must be an index into the block devices table.
+    """
+
+    _fmt = '<QIQI'
+
+    def __init__(self, buffer):
+        (
+            self.num_sectors,
+            self.target_type,
+            self.target_data,
+            self.target_source
+
+        ) = struct.unpack(self._fmt, buffer[0:struct.calcsize(self._fmt)])
+
+
+class LpMetadataHeader(LpMetadataBase):
+    """
+    +-----------------------------------------+
+    | Header data - fixed size                |
+    +-----------------------------------------+
+    | Partition table - variable size         |
+    +-----------------------------------------+
+    | Partition table extents - variable size |
+    +-----------------------------------------+
+
+    Offset 0: Four bytes equal to `SUPER_METADATA_HEADER_MAGIC`
+
+    Offset 4: Version number required to read this metadata. If the version is not
+              equal to the library version, the metadata should be considered incompatible.
+
+    Offset 6: Minor version. A library supporting newer features should be able to
+              read metadata with an older minor version. However, an older library
+              should not support reading metadata if its minor version is higher.
+
+    Offset 8: The size of this header struct.
+
+    Offset 12: SHA256 checksum of the header, up to |header_size| bytes, computed as if this field were set to 0.
+
+    Offset 44: The total size of all tables. This size is contiguous; tables may not
+               have gaps in between, and they immediately follow the header.
+
+    Offset 48: SHA256 checksum of all table contents.
+
+    Offset 80: Partition table descriptor.
+
+    Offset 92: Extent table descriptor.
+
+    Offset 104: Updateable group descriptor.
+
+    Offset 116: Block device table.
+
+    Offset 128: Header flags are independent of the version number and intended to be informational only.
+                New flags can be added without bumping the version.
+
+    Offset 132: Reserved (zero), pad to 256 bytes.
+    """
+
+    _fmt = '<I2hI32sI32s'
+
+    partitions: LpMetadataTableDescriptor = field(default=None)
+    extents: LpMetadataTableDescriptor = field(default=None)
+    groups: LpMetadataTableDescriptor = field(default=None)
+    block_devices: LpMetadataTableDescriptor = field(default=None)
+
+    def __init__(self, buffer):
         (
             self.magic,
             self.major_version,
@@ -94,83 +230,107 @@ class LpMetadataHeader(object):
             self.tables_size,
             self.tables_checksum
 
-        ) = unpack(fmt, buffer[0:calcsize(fmt)])
-        self.partitions = None
-        self.extents = None
-        self.groups = None
-        self.block_devices = None
+        ) = struct.unpack(self._fmt, buffer[0:self.size])
 
 
-class LpMetadataTableDescriptor(object):
+class LpMetadataPartitionGroup(LpMetadataBase):
+    """
+    Offset 0: Name of this group. Any unused characters must be 0.
+
+    Offset 36: Flags (see LP_GROUP_*).
+
+    Offset 40: Maximum size in bytes. If 0, the group has no maximum size.
+    """
+    _fmt = '<36sIQ'
+
     def __init__(self, buffer):
-        fmt = '<3I'
-        (
-            self.offset,
-            self.num_entries,
-            self.entry_size
-
-        ) = unpack(fmt, buffer[:calcsize(fmt)])
-
-
-class LpMetadataPartition(object):
-    def __init__(self, buffer):
-        fmt = '<36s4I'
-        (
-            self.name,
-            self.attributes,
-            self.first_extent_index,
-            self.num_extents,
-            self.group_index
-
-        ) = unpack(fmt, buffer[0:calcsize(fmt)])
-
-
-class LpMetadataExtent(object):
-    def __init__(self, buffer):
-        fmt = '<QIQI'
-        (
-            self.num_sectors,
-            self.target_type,
-            self.target_data,
-            self.target_source
-
-        ) = unpack(fmt, buffer[0:calcsize(fmt)])
-
-
-class LpMetadataPartitionGroup(object):
-    def __init__(self, buffer):
-        fmt = '<36sIQ'
         (
             self.name,
             self.flags,
             self.maximum_size
-        ) = unpack(fmt, buffer[0:calcsize(fmt)])
+        ) = struct.unpack(self._fmt, buffer[0:self.size])
+
+        self.name = self.name.decode("utf-8").strip('\x00')
 
 
-class LpMetadataBlockDevice(object):
+class LpMetadataBlockDevice(LpMetadataBase):
+    """
+    Offset 0: First usable sector for allocating logical partitions. this will be
+              the first sector after the initial geometry blocks, followed by the
+              space consumed by metadata_max_size*metadata_slot_count*2.
+
+    Offset 8: Alignment for defining partitions or partition extents. For example,
+              an alignment of 1MiB will require that all partitions have a size evenly
+              divisible by 1MiB, and that the smallest unit the partition can grow by is 1MiB.
+
+              Alignment is normally determined at runtime when growing or adding
+              partitions. If for some reason the alignment cannot be determined, then
+              this predefined alignment in the geometry is used instead. By default it is set to 1MiB.
+
+    Offset 12: Alignment offset for "stacked" devices. For example, if the "super"
+               partition itself is not aligned within the parent block device's
+               partition table, then we adjust for this in deciding where to place
+               |first_logical_sector|.
+
+               Similar to |alignment|, this will be derived from the operating system.
+               If it cannot be determined, it is assumed to be 0.
+
+    Offset 16: Block device size, as specified when the metadata was created.
+               This can be used to verify the geometry against a target device.
+
+    Offset 24: Partition name in the GPT. Any unused characters must be 0.
+
+    Offset 60: Flags (see LP_BLOCK_DEVICE_* flags below).
+    """
+
+    _fmt = '<Q2IQ36sI'
+
     def __init__(self, buffer):
-        fmt = '<Q2IQ36sI'
         (
             self.first_logical_sector,
             self.alignment,
             self.alignment_offset,
-            self.size,
+            self.block_device_size,
             self.partition_name,
             self.flags
-        ) = unpack(fmt, buffer[0:calcsize(fmt)])
+        ) = struct.unpack(self._fmt, buffer[0:self.size])
+
+        self.partition_name = self.partition_name.decode("utf-8").strip('\x00')
 
 
-class Metadata(object):
-    def __init__(self):
-        self.geometry = None
-        self.partitions = []
-        self.extents = []
-        self.groups = []
-        self.block_devices = []
+@dataclass
+class Metadata:
+    header: LpMetadataHeader = field(default=None)
+    geometry: LpMetadataGeometry = field(default=None)
+    partitions: Iterable[LpMetadataPartition] = field(default_factory=list)
+    extents: Iterable[LpMetadataExtent] = field(default_factory=list)
+    groups: Iterable[LpMetadataPartitionGroup] = field(default_factory=list)
+    block_devices: Iterable[LpMetadataBlockDevice] = field(default_factory=list)
+
+    def get_info(self) -> Dict:
+        result = {}
+        try:
+            result = {
+                "metadata_version": f"{self.header.major_version}.{self.header.minor_version}",
+                "metadata_size": self.header.header_size + self.header.tables_size,
+                "metadata_max_size": self.geometry.metadata_max_size,
+                "metadata_slot_count": self.geometry.metadata_slot_count,
+                # "block_device_partition_name": self.block_devices[:1].partition_name,
+                # "block_device_first_sector": self.block_devices[:1].first_logical_sector,
+                # "block_device_size": self.block_devices[:1].size,
+                "group_table": [
+                    {} for index in range(0, self.header.groups.num_entries)
+                ]
+            }
+        except Exception as e:
+            pass
+        finally:
+            return result
 
 
 class LpUnpackError(Exception):
     """Raised any error unpacking"""
+
     def __init__(self, message):
         self.message = message
 
@@ -249,15 +409,17 @@ class SparseImage(object):
 class LpUnpack(object):
     def __init__(self, **kwargs):
         self.partition_name = kwargs.get('NAME')
+        self._show_info = kwargs.get('SHOW_INFO', False)
         self.slot_num = None
         self.in_file_fd = open(kwargs.get('SUPER_IMAGE'), 'rb')
-        self.out_dir = kwargs.get('OUTPUT_DIR')
+        self._out_dir = kwargs.get('OUTPUT_DIR', None)
 
     def _CheckOutDirExists(self):
-        out_dir = Path(self.out_dir)
-        if not out_dir.exists():
-            out_dir.mkdir(parents=True, exist_ok=True)
-        self.out_dir = out_dir
+        if self._out_dir is None:
+            return
+
+        if not self._out_dir.exists():
+            self._out_dir.mkdir(parents=True, exist_ok=True)
 
     def _ReadChunk(self, block_size):
         while True:
@@ -266,7 +428,7 @@ class LpUnpack(object):
                 break
             yield data
 
-    def ReadPrimaryGeometry(self):
+    def ReadPrimaryGeometry(self) -> LpMetadataGeometry:
         lpMetadataGeometry = LpMetadataGeometry(self.in_file_fd.read(LP_METADATA_GEOMETRY_SIZE))
         if lpMetadataGeometry is not None:
             return lpMetadataGeometry
@@ -367,7 +529,7 @@ class LpUnpack(object):
     def ExtractPartition(self, unpack_job: UnpackJob):
         self._CheckOutDirExists()
         print(f'Extracting partition [{unpack_job.name}] ....', end='', flush=True)
-        out_file = self.out_dir / f'{unpack_job.name}.img'
+        out_file = self._out_dir / f'{unpack_job.name}.img'
         with open(str(out_file), 'wb') as out:
             for part in unpack_job.parts:
                 offset, size = part
@@ -392,6 +554,9 @@ class LpUnpack(object):
                 unpack_job.total_size += size
 
         self.ExtractPartition(unpack_job)
+
+    def show_info(self):
+        pass
 
     def unpack(self):
         try:
@@ -422,53 +587,86 @@ class LpUnpack(object):
                 if self.slot_num > metadata.geometry.metadata_slot_count:
                     raise LpUnpackError('Invalid metadata slot number: {}'.format(self.slot_num))
 
+            if self._show_info:
+                self.show_info()
+
+            # TODO 24.01.2023 UNIX: Check show_info and exist self._out_dir is not None
+            if not self._show_info and self._out_dir is None:
+                raise LpUnpackError(message=f'Not specified directory for extraction')
+
             for partition in metadata.partitions:
                 self.Extract(partition, metadata)
 
         except LpUnpackError as e:
             print(e.message)
             sys.exit(1)
+
         finally:
             self.in_file_fd.close()
 
 
 def create_parser():
-    parser = argparse.ArgumentParser(description='{} - command-line tool for extracting partition images from super'
-                                     .format(Path(sys.argv[0]).name))
-    parser.add_argument(
+    _parser = argparse.ArgumentParser(
+        description=f'{Path(sys.argv[0]).name} - command-line tool for extracting partition images from super'
+    )
+    _parser.add_argument(
         '-p',
         '--partition',
         dest='NAME',
         type=lambda x: re.split("\W+", x),
         help='Extract the named partition. This can be specified multiple times or through the delimiter [","  ":"]'
     )
-    parser.add_argument(
+    _parser.add_argument(
         '-S',
         '--slot',
         dest='NUM',
         type=int,
         help=' !!! No implementation yet !!! Slot number (default is 0).'
     )
-    parser.add_argument('SUPER_IMAGE')
-    parser.add_argument(
+
+    if sys.version_info >= (3, 9):
+        _parser.add_argument(
+            '--info',
+            dest='SHOW_INFO',
+            default=False,
+            action=argparse.BooleanOptionalAction,
+            help='Displays pretty-printed partition metadata'
+        )
+    else:
+        _parser.add_argument(
+            '--info',
+            dest='SHOW_INFO',
+            action='store_true',
+            help='Displays pretty-printed partition metadata'
+        )
+        _parser.add_argument(
+            '--no-info',
+            dest='SHOW_INFO',
+            action='store_false'
+        )
+        _parser.set_defaults(SHOW_INFO=False)
+
+    _parser.add_argument('SUPER_IMAGE')
+    _parser.add_argument(
         'OUTPUT_DIR',
-        type=str,
+        type=Path,
+        nargs='?',
     )
-    return parser
+    return _parser
 
 
-def help(parser):
-    parser.print_help()
-    sys.exit(2)
-
-
-if __name__ == '__main__':
+def main():
     parser = create_parser()
     namespace = parser.parse_args()
     if len(sys.argv) >= 2:
         if not Path(namespace.SUPER_IMAGE).exists():
-            help(parser)
+            parser.print_help()
+            sys.exit(2)
         LpUnpack(**vars(namespace)).unpack()
     else:
         parser.print_usage()
         sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
