@@ -1,10 +1,9 @@
+import argparse
 import re
 import sys
-import argparse
-from pathlib import Path
-from collections import namedtuple
-from struct import pack, unpack, calcsize
 from dataclasses import dataclass, field
+from pathlib import Path
+from struct import pack, unpack, calcsize
 from typing import IO
 
 SPARSE_HEADER_MAGIC = 0xED26FF3A
@@ -23,14 +22,14 @@ class SparseHeader(object):
     def __init__(self, buffer):
         fmt = '<I4H4I'
         (
-            self.magic,             # 0xed26ff3a
-            self.major_version,     # (0x1) - reject images with higher major versions
-            self.minor_versionm,    # (0x0) - allow images with higer minor versions
-            self.file_hdr_sz,       # 28 bytes for first revision of the file format
-            self.chunk_hdr_sz,      # 12 bytes for first revision of the file format
-            self.blk_sz,            # block size in bytes, must be a multiple of 4 (4096)
-            self.total_blks,        # total blocks in the non-sparse output image
-            self.total_chunks,      # total chunks in the sparse input image
+            self.magic,  # 0xed26ff3a
+            self.major_version,  # (0x1) - reject images with higher major versions
+            self.minor_version,  # (0x0) - allow images with higer minor versions
+            self.file_hdr_sz,  # 28 bytes for first revision of the file format
+            self.chunk_hdr_sz,  # 12 bytes for first revision of the file format
+            self.blk_sz,  # block size in bytes, must be a multiple of 4 (4096)
+            self.total_blks,  # total blocks in the non-sparse output image
+            self.total_chunks,  # total chunks in the sparse input image
             self.image_checksum     # CRC32 checksum of the original data, counting "don't care"
         ) = unpack(fmt, buffer[0:calcsize(fmt)])
 
@@ -197,6 +196,12 @@ class SparseImage(object):
         self.header = SparseHeader(self._fd.read(SPARSE_HEADER_SIZE))
         return False if self.header.magic != SPARSE_HEADER_MAGIC else True
 
+    def _read_data(self, chunk_data_size: int):
+        if self.header.chunk_hdr_sz > SPARSE_CHUNK_HEADER_SIZE:
+            self._fd.seek(self.header.chunk_hdr_sz - SPARSE_CHUNK_HEADER_SIZE, 1)
+
+        return self._fd.read(chunk_data_size)
+
     def unsparse(self):
         if not self.header:
             self._fd.seek(0)
@@ -213,9 +218,7 @@ class SparseImage(object):
                 sector_size = (chunk_header.chunk_sz * self.header.blk_sz) >> 9
                 chunk_data_size = chunk_header.total_sz - self.header.chunk_hdr_sz
                 if chunk_header.chunk_type == 0xCAC1:
-                    if self.header.chunk_hdr_sz > SPARSE_CHUNK_HEADER_SIZE:
-                        self._fd.seek(self.header.chunk_hdr_sz - SPARSE_CHUNK_HEADER_SIZE, 1)
-                    data = self._fd.read(chunk_data_size)
+                    data = self._read_data(chunk_data_size)
                     len_data = len(data)
                     if len_data == (sector_size << 9):
                         out.write(data)
@@ -223,18 +226,14 @@ class SparseImage(object):
                         sector_base += sector_size
                 else:
                     if chunk_header.chunk_type == 0xCAC2:
-                        if self.header.chunk_hdr_sz > SPARSE_CHUNK_HEADER_SIZE:
-                            self._fd.seek(self.header.chunk_hdr_sz - SPARSE_CHUNK_HEADER_SIZE, 1)
-                        data = self._fd.read(chunk_data_size)
+                        data = self._read_data(chunk_data_size)
                         len_data = sector_size << 9
                         out.write(pack("B", 0) * len_data)
                         output_len += len(data)
                         sector_base += sector_size
                     else:
                         if chunk_header.chunk_type == 0xCAC3:
-                            if self.header.chunk_hdr_sz > SPARSE_CHUNK_HEADER_SIZE:
-                                self._fd.seek(self.header.chunk_hdr_sz - SPARSE_CHUNK_HEADER_SIZE, 1)
-                            data = self._fd.read(chunk_data_size)
+                            data = self._read_data(chunk_data_size)
                             len_data = sector_size << 9
                             out.write(pack("B", 0) * len_data)
                             output_len += len(data)
@@ -251,7 +250,6 @@ class LpUnpack(object):
     def __init__(self, **kwargs):
         self.partition_name = kwargs.get('NAME')
         self.slot_num = None
-        # self.slot_num = int(kwargs.get('NUM')) if kwargs.get('NUM') else 0
         self.in_file_fd = open(kwargs.get('SUPER_IMAGE'), 'rb')
         self.out_dir = kwargs.get('OUTPUT_DIR')
 
@@ -321,8 +319,8 @@ class LpUnpack(object):
         if metadata.geometry.metadata_max_size % LP_SECTOR_SIZE != 0:
             raise LpUnpackError('Metadata max size is not sector-aligned.')
 
-        offsets = [self.GetPrimaryMetadataOffset(metadata.geometry, slot_number=0), #self.slot_num
-                   self.GetBackupMetadataOffset(metadata.geometry, slot_number=0)] #self.slot_num
+        offsets = [self.GetPrimaryMetadataOffset(metadata.geometry, slot_number=0),
+                   self.GetBackupMetadataOffset(metadata.geometry, slot_number=0)]
 
         metadata.header = self.ParseHeaderMetadata(offsets)
 
