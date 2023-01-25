@@ -1,10 +1,12 @@
 import argparse
+import io
 import re
 import struct
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Dict, Iterable
+from typing import IO, Dict, List, TypeVar, cast, BinaryIO
+from string import Template
 
 SPARSE_HEADER_MAGIC = 0xED26FF3A
 SPARSE_HEADER_SIZE = 28
@@ -15,7 +17,64 @@ LP_METADATA_GEOMETRY_MAGIC = 0x616c4467
 LP_METADATA_GEOMETRY_SIZE = 4096
 LP_METADATA_HEADER_MAGIC = 0x414C5030
 LP_SECTOR_SIZE = 512
+
 LP_TARGET_TYPE_LINEAR = 0
+LP_TARGET_TYPE_ZERO = 1
+
+LP_PARTITION_ATTR_READONLY = (1 << 0)
+LP_PARTITION_ATTR_SLOT_SUFFIXED = (1 << 1)
+LP_PARTITION_ATTR_UPDATED = (1 << 2)
+LP_PARTITION_ATTR_DISABLED = (1 << 3)
+
+LP_BLOCK_DEVICE_SLOT_SUFFIXED = (1 << 0)
+
+LP_GROUP_SLOT_SUFFIXED = (1 << 0)
+
+PLAIN_TEXT_TEMPLATE = """Slot 0:
+Metadata version: $metadata_version
+Metadata size: $metadata_size bytes
+Metadata max size: $metadata_max_size bytes
+Metadata slot count: $metadata_slot_count
+Header flags: $header_flags
+Partition table:
+------------------------
+$partitions
+------------------------
+Super partition layout:
+------------------------
+$layouts
+------------------------
+Block device table:
+------------------------
+$blocks
+------------------------
+Group table:
+------------------------
+$groups
+"""
+
+
+def build_attribute_string(attributes: int) -> str:
+    match attributes:
+        case attributes if (attributes & LP_PARTITION_ATTR_READONLY):
+            result = "readonly"
+        case attributes if (attributes & LP_PARTITION_ATTR_SLOT_SUFFIXED):
+            result = "slot-suffixed"
+        case attributes if (attributes & LP_PARTITION_ATTR_UPDATED):
+            result = "updated"
+        case attributes if (attributes & LP_PARTITION_ATTR_DISABLED):
+            result = "disabled"
+        case _:
+            result = "none"
+    return result
+
+
+def build_block_device_flag_string(flags: int) -> str:
+    return "slot-suffixed" if (flags & LP_BLOCK_DEVICE_SLOT_SUFFIXED) else "none"
+
+
+def build_group_flag_string(flags: int) -> str:
+    return "slot-suffixed" if (flags & LP_GROUP_SLOT_SUFFIXED) else "none"
 
 
 class SparseHeader(object):
@@ -65,7 +124,7 @@ class LpMetadataGeometry(LpMetadataBase):
     """
     Offset 0: Magic signature
 
-    Offset 4: Size of the `MetadataGeometry`
+    Offset 4: Size of the `LpMetadataGeometry`
 
     Offset 8: SHA256 checksum
 
@@ -181,7 +240,7 @@ class LpMetadataHeader(LpMetadataBase):
     | Partition table extents - variable size |
     +-----------------------------------------+
 
-    Offset 0: Four bytes equal to `SUPER_METADATA_HEADER_MAGIC`
+    Offset 0: Four bytes equal to `LP_METADATA_HEADER_MAGIC`
 
     Offset 4: Version number required to read this metadata. If the version is not
               equal to the library version, the metadata should be considered incompatible.
@@ -231,6 +290,7 @@ class LpMetadataHeader(LpMetadataBase):
             self.tables_checksum
 
         ) = struct.unpack(self._fmt, buffer[0:self.size])
+        self.flags = 0
 
 
 class LpMetadataPartitionGroup(LpMetadataBase):
@@ -302,12 +362,68 @@ class LpMetadataBlockDevice(LpMetadataBase):
 class Metadata:
     header: LpMetadataHeader = field(default=None)
     geometry: LpMetadataGeometry = field(default=None)
-    partitions: Iterable[LpMetadataPartition] = field(default_factory=list)
-    extents: Iterable[LpMetadataExtent] = field(default_factory=list)
-    groups: Iterable[LpMetadataPartitionGroup] = field(default_factory=list)
-    block_devices: Iterable[LpMetadataBlockDevice] = field(default_factory=list)
+    partitions: List[LpMetadataPartition] = field(default_factory=list)
+    extents: List[LpMetadataExtent] = field(default_factory=list)
+    groups: List[LpMetadataPartitionGroup] = field(default_factory=list)
+    block_devices: List[LpMetadataBlockDevice] = field(default_factory=list)
+
+    @property
+    def metadata_region(self) -> int:
+        if self.geometry is None:
+            return 0
+
+        return LP_PARTITION_RESERVED_BYTES + (
+                LP_METADATA_GEOMETRY_SIZE + self.geometry.metadata_max_size * self.geometry.metadata_slot_count
+        ) * 2
+
+    def _get_extents_string(self, partition: LpMetadataPartition) -> List[str]:
+        result = []
+        first_sector = 0
+        for extent_number in range(partition.num_extents):
+            index = partition.first_extent_index + extent_number
+            extent = self.extents[index]
+
+            _base = f"{first_sector} .. {first_sector + extent.num_sectors - 1}"
+            first_sector += extent.num_sectors
+
+            if extent.target_type == LP_TARGET_TYPE_LINEAR:
+                result.append(
+                    f"{_base} linear {self.block_devices[extent.target_source].partition_name} {extent.target_data}"
+                )
+            elif extent.target_type == LP_TARGET_TYPE_ZERO:
+                result.append(f"{_base} zero")
+
+        return result
+
+    def _get_partition_layout(self) -> List[str]:
+        result = []
+
+        for partition in self.partitions:
+            for extent_number in range(partition.num_extents):
+                index = partition.first_extent_index + extent_number
+                extent = self.extents[index]
+
+                block_device_name = ""
+
+                if extent.target_type == LP_TARGET_TYPE_LINEAR:
+                    block_device_name = self.block_devices[extent.target_source].partition_name
+
+                result.append(
+                    f"{block_device_name}: {extent.target_data} .. {extent.target_data + extent.num_sectors}: "
+                    f"{partition.name} ({extent.num_sectors} sectors)"
+                )
+
+        return result
+
+    def get_offsets(self, slot_number: int = 0) -> List[int]:
+        base = LP_PARTITION_RESERVED_BYTES + (LP_METADATA_GEOMETRY_SIZE * 2)
+        _tmp_offset = self.geometry.metadata_max_size * slot_number
+        primary_offset = base + _tmp_offset
+        backup_offset = base + self.geometry.metadata_max_size * self.geometry.metadata_slot_count + _tmp_offset
+        return [primary_offset, backup_offset]
 
     def get_info(self) -> Dict:
+        # TODO 25.01.2023: Liblp version 1.2 build_header_flag_string check header version 1.2
         result = {}
         try:
             result = {
@@ -315,17 +431,79 @@ class Metadata:
                 "metadata_size": self.header.header_size + self.header.tables_size,
                 "metadata_max_size": self.geometry.metadata_max_size,
                 "metadata_slot_count": self.geometry.metadata_slot_count,
-                # "block_device_partition_name": self.block_devices[:1].partition_name,
-                # "block_device_first_sector": self.block_devices[:1].first_logical_sector,
-                # "block_device_size": self.block_devices[:1].size,
+                "header_flags": "none",
+                "block_devices": [
+                    {
+                        "name": item.partition_name,
+                        "first_sector": item.first_logical_sector,
+                        "size": item.block_device_size,
+                        "block_size": item.size,
+                        "flags": build_block_device_flag_string(item.flags),
+                        "alignment": item.alignment
+                    } for item in self.block_devices
+                ],
                 "group_table": [
-                    {} for index in range(0, self.header.groups.num_entries)
-                ]
+                    {
+                        "name": self.groups[index].name,
+                        "group_max_size": self.groups[index].maximum_size,
+                        "flags": build_group_flag_string(self.groups[index].flags)
+                    } for index in range(0, self.header.groups.num_entries)
+                ],
+                "partition_table": [
+                    {
+                        "name": item.name,
+                        "group_name": self.groups[item.group_index].name,
+                        "is_dynamic": True,
+                        "size": self.extents[item.first_extent_index].target_data,
+                        "attributes": build_attribute_string(item.attributes),
+                        "extents": self._get_extents_string(item)
+                    } for item in self.partitions
+                ],
+                "partition_layout": self._get_partition_layout()
             }
         except Exception as e:
             pass
         finally:
             return result
+
+    def __str__(self):
+        data = self.get_info()
+        if not data:
+            return ""
+
+        template = Template(PLAIN_TEXT_TEMPLATE)
+        layouts = "\n".join(data["partition_layout"])
+        partitions = "------------------------\n".join(
+            [
+                "  Name: {}\n  Group: {}\n  Attributes: {}\n  Extents:\n    {}\n".format(
+                    item["name"],
+                    item["group_name"],
+                    item["attributes"],
+                    "\n".join(item["extents"])
+                ) for item in data["partition_table"]
+            ]
+        )[:-1]
+        blocks = "\n".join(
+            [
+                "  Partition name: {}\n  First sector: {}\n  Size: {} bytes\n  Flags: {}".format(
+                    item["name"],
+                    item["first_sector"],
+                    item["size"],
+                    item["flags"]
+                )
+                for item in data["block_devices"]
+            ]
+        )
+        groups = "------------------------\n".join(
+            [
+                "  Name: {}\n  Maximum size: {} bytes\n  Flags: {}\n".format(
+                    item["name"],
+                    item["group_max_size"],
+                    item["flags"]
+                ) for item in data["group_table"]
+            ]
+        )[:-1]
+        return template.substitute(partitions=partitions, layouts=layouts, blocks=blocks, groups=groups, **data)
 
 
 class LpUnpackError(Exception):
@@ -346,7 +524,7 @@ class UnpackJob:
     total_size: int = field(default=0)
 
 
-class SparseImage(object):
+class SparseImage:
     def __init__(self, fd):
         self._fd = fd
         self.header = None
@@ -388,22 +566,25 @@ class SparseImage(object):
                     if chunk_header.chunk_type == 0xCAC2:
                         data = self._read_data(chunk_data_size)
                         len_data = sector_size << 9
-                        out.write(pack("B", 0) * len_data)
+                        out.write(struct.pack("B", 0) * len_data)
                         output_len += len(data)
                         sector_base += sector_size
                     else:
                         if chunk_header.chunk_type == 0xCAC3:
                             data = self._read_data(chunk_data_size)
                             len_data = sector_size << 9
-                            out.write(pack("B", 0) * len_data)
+                            out.write(struct.pack("B", 0) * len_data)
                             output_len += len(data)
                             sector_base += sector_size
                         else:
                             len_data = sector_size << 9
-                            out.write(pack("B", 0) * len_data)
+                            out.write(struct.pack("B", 0) * len_data)
                             sector_base += sector_size
                 chunks -= 1
         return unsparse_file
+
+
+T = TypeVar('T')
 
 
 class LpUnpack(object):
@@ -411,8 +592,15 @@ class LpUnpack(object):
         self.partition_name = kwargs.get('NAME')
         self._show_info = kwargs.get('SHOW_INFO', False)
         self.slot_num = None
-        self.in_file_fd = open(kwargs.get('SUPER_IMAGE'), 'rb')
+        self._fd: BinaryIO = open(kwargs.get('SUPER_IMAGE'), 'rb')
         self._out_dir = kwargs.get('OUTPUT_DIR', None)
+
+    def _get_data(self, count: int, size: int, clazz: T) -> List[T]:
+        result = []
+        while count > 0:
+            result.append(clazz(self._fd.read(size)))
+            count -= 1
+        return result
 
     def _CheckOutDirExists(self):
         if self._out_dir is None:
@@ -423,54 +611,42 @@ class LpUnpack(object):
 
     def _ReadChunk(self, block_size):
         while True:
-            data = self.in_file_fd.read(block_size)
+            data = self._fd.read(block_size)
             if not data:
                 break
             yield data
 
-    def ReadPrimaryGeometry(self) -> LpMetadataGeometry:
-        lpMetadataGeometry = LpMetadataGeometry(self.in_file_fd.read(LP_METADATA_GEOMETRY_SIZE))
-        if lpMetadataGeometry is not None:
-            return lpMetadataGeometry
+    def _read_primary_geometry(self) -> LpMetadataGeometry:
+        geometry = LpMetadataGeometry(self._fd.read(LP_METADATA_GEOMETRY_SIZE))
+        if geometry is not None:
+            return geometry
         else:
-            return self.ReadBackupGeometry()
+            return LpMetadataGeometry(self._fd.read(LP_METADATA_GEOMETRY_SIZE))
 
-    def ReadBackupGeometry(self):
-        return LpMetadataGeometry(self.in_file_fd.read(LP_METADATA_GEOMETRY_SIZE))
-
-    def GetPrimaryMetadataOffset(self, geometry, slot_number=0):
-        return LP_PARTITION_RESERVED_BYTES + (LP_METADATA_GEOMETRY_SIZE * 2) + geometry.metadata_max_size * slot_number
-
-    def GetBackupMetadataOffset(self, geometry, slot_number=0):
-        start = LP_PARTITION_RESERVED_BYTES + (LP_METADATA_GEOMETRY_SIZE * 2) + \
-                geometry.metadata_max_size * geometry.metadata_slot_count
-        return start + geometry.metadata_max_size * slot_number
-
-    def ParseHeaderMetadata(self, offsets):
-        header = None
+    def _read_metadata_header(self, metadata: Metadata):
+        offsets = metadata.get_offsets()
         for index, offset in enumerate(offsets):
-            self.in_file_fd.seek(offset, 0)
-            header = LpMetadataHeader(self.in_file_fd.read(80))
-            header.partitions = LpMetadataTableDescriptor(self.in_file_fd.read(12))
-            header.extents = LpMetadataTableDescriptor(self.in_file_fd.read(12))
-            header.groups = LpMetadataTableDescriptor(self.in_file_fd.read(12))
-            header.block_devices = LpMetadataTableDescriptor(self.in_file_fd.read(12))
+            self._fd.seek(offset, io.SEEK_SET)
+            header = LpMetadataHeader(self._fd.read(cast(int, LpMetadataHeader.size)))
+            header.partitions = LpMetadataTableDescriptor(self._fd.read(cast(int, LpMetadataTableDescriptor.size)))
+            header.extents = LpMetadataTableDescriptor(self._fd.read(cast(int, LpMetadataTableDescriptor.size)))
+            header.groups = LpMetadataTableDescriptor(self._fd.read(cast(int, LpMetadataTableDescriptor.size)))
+            header.block_devices = LpMetadataTableDescriptor(self._fd.read(cast(int, LpMetadataTableDescriptor.size)))
 
             if header.magic != LP_METADATA_HEADER_MAGIC:
-                if index + 1 > len(offsets):
+                check_index = index + 1
+                if check_index > len(offsets):
                     raise LpUnpackError('Logical partition metadata has invalid magic value.')
                 else:
-                    print('Read Backup header by offset 0x{:x}'.format(offsets[index + 1]))
+                    print(f'Read Backup header by offset 0x{offsets[check_index]:x}')
                     continue
 
-            self.in_file_fd.seek(offset + header.header_size, 0)
+            metadata.header = header
+            self._fd.seek(offset + header.header_size, io.SEEK_SET)
 
-        return header
-
-    def ReadMetadata(self):
-        metadata = Metadata()
-        self.in_file_fd.seek(LP_PARTITION_RESERVED_BYTES, 0)
-        metadata.geometry = self.ReadPrimaryGeometry()
+    def _read_metadata(self):
+        self._fd.seek(LP_PARTITION_RESERVED_BYTES, io.SEEK_SET)
+        metadata = Metadata(geometry=self._read_primary_geometry())
 
         if metadata.geometry.magic != LP_METADATA_GEOMETRY_MAGIC:
             raise LpUnpackError('Logical partition metadata has invalid geometry magic signature.')
@@ -481,43 +657,43 @@ class LpUnpack(object):
         if metadata.geometry.metadata_max_size % LP_SECTOR_SIZE != 0:
             raise LpUnpackError('Metadata max size is not sector-aligned.')
 
-        offsets = [self.GetPrimaryMetadataOffset(metadata.geometry, slot_number=0),
-                   self.GetBackupMetadataOffset(metadata.geometry, slot_number=0)]
+        self._read_metadata_header(metadata)
 
-        metadata.header = self.ParseHeaderMetadata(offsets)
+        metadata.partitions = self._get_data(
+            metadata.header.partitions.num_entries,
+            metadata.header.partitions.entry_size,
+            LpMetadataPartition
+        )
 
-        for index in range(0, metadata.header.partitions.num_entries):
-            partition = LpMetadataPartition(self.in_file_fd.read(metadata.header.partitions.entry_size))
-            partition.name = str(partition.name, 'utf-8').strip('\x00')
-            metadata.partitions.append(partition)
+        metadata.extents = self._get_data(
+            metadata.header.extents.num_entries,
+            metadata.header.extents.entry_size,
+            LpMetadataExtent
+        )
 
-        for index in range(0, metadata.header.extents.num_entries):
-            metadata.extents.append(LpMetadataExtent(self.in_file_fd.read(metadata.header.extents.entry_size)))
+        metadata.groups = self._get_data(
+            metadata.header.groups.num_entries,
+            metadata.header.groups.entry_size,
+            LpMetadataPartitionGroup
+        )
 
-        for index in range(0, metadata.header.groups.num_entries):
-            group = LpMetadataPartitionGroup(self.in_file_fd.read(metadata.header.groups.entry_size))
-            group.name = str(group.name, 'utf-8').strip('\x00')
-            metadata.groups.append(group)
-
-        for index in range(0, metadata.header.block_devices.num_entries):
-            block_device = LpMetadataBlockDevice(self.in_file_fd.read(metadata.header.block_devices.entry_size))
-            block_device.partition_name = str(block_device.partition_name, 'utf-8').strip('\x00')
-            metadata.block_devices.append(block_device)
+        metadata.block_devices = self._get_data(
+            metadata.header.block_devices.num_entries,
+            metadata.header.block_devices.entry_size,
+            LpMetadataBlockDevice
+        )
 
         try:
-            super_device = metadata.block_devices[0]
-            metadata_region = LP_PARTITION_RESERVED_BYTES + (LP_METADATA_GEOMETRY_SIZE +
-                                                             metadata.geometry.metadata_max_size *
-                                                             metadata.geometry.metadata_slot_count) * 2
-            if metadata_region > super_device.first_logical_sector * LP_SECTOR_SIZE:
+            super_device: LpMetadataBlockDevice = cast(LpMetadataBlockDevice, iter(metadata.block_devices).__next__())
+            if metadata.metadata_region > super_device.first_logical_sector * LP_SECTOR_SIZE:
                 raise LpUnpackError('Logical partition metadata overlaps with logical partition contents.')
-        except IndexError:
+        except StopIteration:
             raise LpUnpackError('Metadata does not specify a super device.')
 
         return metadata
 
     def _WriteExtent(self, fd: IO, offset: int, size: int, block_size: int):
-        self.in_file_fd.seek(offset)
+        self._fd.seek(offset)
         for block in self._ReadChunk(block_size):
             if size == 0:
                 break
@@ -555,22 +731,20 @@ class LpUnpack(object):
 
         self.ExtractPartition(unpack_job)
 
-    def show_info(self):
-        pass
-
     def unpack(self):
         try:
-            if SparseImage(self.in_file_fd).check():
+            if SparseImage(self._fd).check():
                 print('Sparse image detected.')
                 print('Process conversion to non sparse image ....', end='', flush=True)
-                unsparse_file = SparseImage(self.in_file_fd).unsparse()
-                self.in_file_fd.close()
-                self.in_file_fd = open(str(unsparse_file), 'rb')
+                unsparse_file = SparseImage(self._fd).unsparse()
+                self._fd.close()
+                self._fd = open(str(unsparse_file), 'rb')
                 print('[ok]')
 
-            self.in_file_fd.seek(0)
-            metadata = self.ReadMetadata()
-
+            self._fd.seek(0)
+            metadata = self._read_metadata()
+            print(metadata)
+            sys.exit(0)
             if self.partition_name:
                 filter_partition = []
                 filter_extents = []
@@ -602,7 +776,7 @@ class LpUnpack(object):
             sys.exit(1)
 
         finally:
-            self.in_file_fd.close()
+            self._fd.close()
 
 
 def create_parser():
