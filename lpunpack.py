@@ -644,6 +644,7 @@ class SparseImage:
                         data = self._read_data(chunk_data_size)
                         len_data = sector_size << 9
                         out.truncate(out.tell() + len_data)
+                        out.seek(0, 2)
                         output_len += len(data)
                         sector_base += sector_size
                     else:
@@ -651,11 +652,13 @@ class SparseImage:
                             data = self._read_data(chunk_data_size)
                             len_data = sector_size << 9
                             out.truncate(out.tell() + len_data)
+                            out.seek(0, 2)
                             output_len += len(data)
                             sector_base += sector_size
                         else:
                             len_data = sector_size << 9
                             out.truncate(out.tell() + len_data)
+                            out.seek(0, 2)
                             sector_base += sector_size
                 chunks -= 1
         return unsparse_file
